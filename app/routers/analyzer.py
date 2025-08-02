@@ -2,8 +2,8 @@ from typing import Annotated
 from typing import Literal
 
 from celery.result import AsyncResult
-from fastapi import APIRouter, Path, Query, HTTPException, Depends
-from sqlalchemy import select
+from fastapi import APIRouter, Path, Query, Depends, logger
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backend.db_depends import get_db
@@ -47,39 +47,59 @@ async def get_task_status(
     - Результат анализа (если задача завершена)
     - Информацию об ошибке (если задача завершилась с ошибкой)
     """
-    # Получаем информацию о задаче из Celery
     task_result = AsyncResult(task_id)
-
     response_data = {
         "task_id": task_id,
         "task_status": task_result.status,
         "document_id": None,
         "analysis_result": None,
-        "issues_found": False,
+        "issues_found": None,
+        "progress": 0,
         "error": None
     }
 
-    # Если задача завершена успешно
+    # Task completed successfully
     if task_result.successful():
         result = task_result.result
-        response_data.update({
-            "document_id": result.get("document_id"),
-            "analysis_result": "completed" if result.get("status") == "success" else "failed",
-            "issues_found": None
-        })
 
-        # Если нужно, можно добавить информацию о найденных проблемах
-        if result.get("status") == "success":
-            issues = await db.scalars(
-                select(AnalyzedDocIssues).where(AnalyzedDocIssues.document_id == result.get("document_id"))
-            )
-            response_data["issues_found"] = bool(issues.all())
+        # Ensure we have the document_id
+        doc_id = result.get("document_id")
+        response_data["document_id"] = doc_id
 
-    # Если задача завершилась с ошибкой
+        # Handle different completion states
+        if result.get("analysis_result") == "completed_no_issues":
+            response_data.update({
+                "analysis_result": "completed",
+                "issues_found": False,
+                "progress": 100
+            })
+        elif result.get("analysis_result") in ("completed_with_issues", "completed_with_issues_and_failed_to_inserted"):
+            # Only query DB if we're sure the task is fully complete
+            if result.get("progress") == 100:
+                issues_count = await db.scalar(
+                    select(func.count(AnalyzedDocIssues.id))
+                    .where(AnalyzedDocIssues.document_id == doc_id)
+                )
+                response_data.update({
+                    "analysis_result": "completed",
+                    "issues_found": issues_count > 0,
+                    "progress": 100,
+                    "issues_count": issues_count
+                })
+            else:
+                # Task is still processing issues
+                response_data.update({
+                    "analysis_result": "processing",
+                    "progress": result.get("progress", 0)
+                })
+
+    # Task failed
     elif task_result.failed():
+        error_info = str(task_result.result)
         response_data.update({
-            "error": str(task_result.result),
             "analysis_result": "failed",
+            "error": error_info,
+            "progress": 100,
             "issues_found": False
         })
 
@@ -96,37 +116,71 @@ async def get_document_status(
     """
     Проверяет статус анализа для конкретного документа.
     Возвращает:
-    - Был ли документ проанализирован
-    - Количество найденных проблем
-    - Общую информацию об анализе
+    - analyzed: Был ли документ проанализирован
+    - issues_count: Количество найденных проблем
+    - status: Статус анализа (not_analyzed/in_progress/completed)
+    - sample_issues: Примеры проблем (первые 3)
     """
-    # Проверяем, есть ли записи об анализе этого документа
-    exists = await db.scalar(
-        select(AnalyzedDocIssues).where(AnalyzedDocIssues.document_id == doc_id).exists().select()
-    )
+    try:
+        # Check for existing analysis (single query with aggregation)
+        analysis_data = await db.execute(
+            select(
+                func.count(AnalyzedDocIssues.id).label('total_issues'),
+                func.array_agg(
+                    case(
+                        (AnalyzedDocIssues.severity == 'critical', 'CRITICAL: ' + AnalyzedDocIssues.issue),
+                        (AnalyzedDocIssues.severity == 'major', 'MAJOR: ' + AnalyzedDocIssues.issue),
+                        else_='MINOR: ' + AnalyzedDocIssues.issue
+                    )
+                ).label('formatted_issues')
+            )
+            .where(AnalyzedDocIssues.document_id == doc_id)
+        )
+        result = analysis_data.first()
 
-    if not exists:
+        if result and result.total_issues > 0:
+            return DocumentAnalysisStatusResponse(
+                document_id=doc_id,
+                analyzed=True,
+                issues_count=result.total_issues,
+                status="completed",
+                last_analyzed=None,  # Removed since model doesn't have created_at
+                sample_issues=result.formatted_issues[:3] if result.formatted_issues else None
+            )
+
+        # Check active Celery tasks
+        from app.celery_app import celery_app
+        inspector = celery_app.control.inspect()
+
+        is_being_analyzed = False
+        if active_tasks := inspector.active():
+            for worker_tasks in active_tasks.values():
+                for task in worker_tasks:
+                    task_args = task.get('args', [])
+                    task_kwargs = task.get('kwargs', {})
+                    if (isinstance(task_args, (list, tuple)) and len(task_args) > 0 and task_args[0] == doc_id) or \
+                            (isinstance(task_kwargs, dict) and task_kwargs.get('doc_id') == doc_id):
+                        is_being_analyzed = True
+                        break
+
         return DocumentAnalysisStatusResponse(
             document_id=doc_id,
             analyzed=False,
             issues_count=0,
-            status="not_analyzed"
+            status="in_progress" if is_being_analyzed else "not_analyzed",
+            last_analyzed=None,
+            sample_issues=None
         )
 
-    # Получаем все проблемы для документа
-    issues = await db.scalars(
-        select(AnalyzedDocIssues).where(AnalyzedDocIssues.document_id == doc_id)
-    )
-    issues_list = issues.all()
-
-    return DocumentAnalysisStatusResponse(
-        document_id=doc_id,
-        analyzed=True,
-        issues_count=len(issues_list),
-        status="completed",
-        last_analyzed=issues_list[0].created_at if issues_list else None,
-        sample_issues=[issue.issue for issue in issues_list[:3]] if issues_list else []
-    )
+    except Exception as e:
+        return DocumentAnalysisStatusResponse(
+            document_id=doc_id,
+            analyzed=False,
+            issues_count=0,
+            status="not_analyzed",
+            last_analyzed=None,
+            sample_issues=None
+        )
 
 
 @router.get('/result', status_code=200)
