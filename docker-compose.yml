@@ -37,5 +37,20 @@ services:
 #    ports:
 #      - "6379:6379"
 
+  worker:
+    build: .
+    container_name: aianalyzer_worker
+    command: celery -A app.celery_app.celery_app worker --loglevel=info --queues=default,document_processing
+    volumes:
+      - ./app:/app/app
+    environment:
+      DOCUMENT_SERVICE_URL: http://host.docker.internal:8000
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/aianalyzer
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+
 volumes:
   pgdata: 

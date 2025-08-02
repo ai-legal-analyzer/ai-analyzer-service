@@ -42,7 +42,7 @@ class AnalysisStatusResponse(BaseModel):
     status: str
     message: str
     document_id: int
-    task_id: int
+    task_id: str
 
 
 class TaskStatusResponse(BaseModel):
@@ -50,7 +50,7 @@ class TaskStatusResponse(BaseModel):
     task_status: str  # PENDING, STARTED, SUCCESS, FAILURE, RETRY, REVOKED etc.
     document_id: Optional[int]
     analysis_result: Optional[str]  # completed, failed, in_progress
-    issues_found: Optional[List[dict]]
+    issues_found: Optional[bool]
     error: Optional[str]
 
 class DocumentAnalysisStatusResponse(BaseModel):

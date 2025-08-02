@@ -55,6 +55,7 @@ async def get_task_status(
         "task_status": task_result.status,
         "document_id": None,
         "analysis_result": None,
+        "issues_found": False,
         "error": None
     }
 
@@ -72,13 +73,14 @@ async def get_task_status(
             issues = await db.scalars(
                 select(AnalyzedDocIssues).where(AnalyzedDocIssues.document_id == result.get("document_id"))
             )
-            response_data["issues_found"] = issues.all()
+            response_data["issues_found"] = bool(issues.all())
 
     # Если задача завершилась с ошибкой
     elif task_result.failed():
         response_data.update({
             "error": str(task_result.result),
-            "analysis_result": "failed"
+            "analysis_result": "failed",
+            "issues_found": False
         })
 
     return response_data
@@ -128,12 +130,12 @@ async def get_document_status(
 
 
 @router.get('/result', status_code=200)
-async def get_result(doc_id: Annotated[int, Query(ge=0)], db: Annotated[AsyncSession, Depends(get_db)]):
-    try:
-        result = await db.scalars(select(AnalyzedDocIssues).where(AnalyzedDocIssues.document_id == doc_id))
-        return result.all()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
+async def get_result(
+        doc_id: int,
+        db: AsyncSession = Depends(get_db)
+):
+    results = await db.scalars(
+        select(AnalyzedDocIssues)
+        .where(AnalyzedDocIssues.document_id == doc_id)
+    )
+    return results.all()
