@@ -27,7 +27,7 @@ app.add_middleware(
 
 app.include_router(analyzer.router)
 
-
+# Rewrite to the current methods
 @app.on_event("startup")
 async def on_startup():
     logger.info("Initializing database...")
